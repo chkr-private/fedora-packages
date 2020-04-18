@@ -8,7 +8,7 @@
 
 import logging
 import threading
-import Queue as queue
+import queue
 
 log = logging.getLogger(__name__)
 

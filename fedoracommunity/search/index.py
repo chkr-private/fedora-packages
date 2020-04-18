@@ -150,7 +150,7 @@ class Indexer(object):
             metadata = AppStreamGlib.Store()
 
             with gzip.open(target, 'rb') as f:
-                metadata.from_xml(f.read(), '')
+                metadata.from_xml(f.read().decode("utf-8"), '')
 
             for app in metadata.get_apps():
                 # Other types are 'stock' and 'unknown'
