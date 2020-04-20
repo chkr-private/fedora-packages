@@ -45,11 +45,11 @@ if __name__=="__main__":
     (options, args) = parser.parse_args()
 
     if options.debug:
-        logging.basicConfig(level=logging.DEBUG)
+        logging.basicConfig(level=logging.DEBUG,format='%(levelname)s:%(threadName)s:%(filename)s:%(funcName)s: %(message)s')
     elif options.verbose:
-        logging.basicConfig(level=logging.INFO)
+        logging.basicConfig(level=logging.INFO,format='%(levelname)s:%(threadName)s:%(filename)s:%(funcName)s: %(message)s')
     else:
-        logging.basicConfig(level=logging.WARN)
+        logging.basicConfig(level=logging.WARN,format='%(levelname)s:%(threadName)s:%(filename)s:%(funcName)s: %(message)s')
 
 
     lockfile = LockFile(os.path.join(options.cache_path, '.fcomm_index_lock'))

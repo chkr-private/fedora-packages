@@ -11,7 +11,9 @@ import logging
 import shutil
 import tarfile
 import threading
+import traceback
 import re
+import pprint
 
 import requests
 import xapian
@@ -19,7 +21,7 @@ import pdc_client
 
 from os.path import join
 
-from utils import filter_search_string
+from fedoracommunity.search.utils import filter_search_string
 
 import gi
 
@@ -30,12 +32,15 @@ from gi.repository import AppStreamGlib
 # It is on the roof.
 import fedoracommunity.pool
 
-local = threading.local()
-local.http = requests.session()
-log = logging.getLogger()
-
 # how many time to retry a downed server
 MAX_RETRY = 10
+
+local = threading.local()
+local.http = requests.session()
+adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=MAX_RETRY)
+local.http.mount('https://', adapter)
+local.http.mount('http://', adapter)
+log = logging.getLogger()
 
 
 def download_file(url, dest):
@@ -46,6 +51,9 @@ def download_file(url, dest):
 
     log.info("Downloading %s to %s" % (url, dest))
     r = local.http.get(url, stream=True)
+    if not bool(r):
+        log.warn("Can't download %s" % (url))
+        return
     with open(dest, 'wb') as f:
         for chunk in r.iter_content(chunk_size=1024):
             if not chunk:
@@ -77,41 +85,62 @@ class Indexer(object):
         self.icons_path = join(cache_path, 'icons')
         self.default_icon = 'package_128x128.png'
         self.bodhi_url = bodhi_url or "https://bodhi.fedoraproject.org"
-        self.mdapi_url = mdapi_url or "https://apps.fedoraproject.org/mdapi"
-        self.icons_url = icons_url or "https://alt.fedoraproject.org/pub/alt/screenshots"
+        self.mdapi_url = mdapi_url or "https://mdapi.fedoraproject.org"
+        self.icons_url = icons_url or "https://dl.fedoraproject.org/pub/alt/screenshots"
         self.pagure_url = pagure_url or "https://src.fedoraproject.org/api/0"
         self.icon_cache = {}
         pdc_url = pdc_url or "https://pdc.fedoraproject.org/rest_api/v1"
-        self.pdc = pdc_client.PDCClient(pdc_url, develop=True, page_size=100)
+        self.pdc = pdc_client.PDCClientWithPage(pdc_url, develop=True)
+        adapter = requests.adapters.HTTPAdapter(pool_connections=30, pool_maxsize=30, max_retries=MAX_RETRY)
+        self.pdc.session.mount('https://', adapter)
+        self.pdc.session.mount('http://', adapter)
 
         self.active_fedora_releases = self._get_active_fedora_releases()
 
         self.create_index()
 
     def _call_api(self, url):
+        retry = 0
         data = {}
-        response = local.http.get(url)
-        if bool(response):
-            data = response.json()
+        while retry < 3:
+            log.debug("API call (_call_api) try %d, url %s" % (retry, url))
+            try:
+                response = local.http.get(url)
+                if bool(response):
+                    data = response.json()
+                break
+            except:
+                log.warning("API call (_call_api) failed for %s" % url)
+            retry = retry + 1
 
         return data
 
     def create_index(self):
         """ Create a new index, and set up its field structure """
+        log.warning("start create_index");
         self.db = xapian.WritableDatabase(self.dbpath, xapian.DB_CREATE_OR_OPEN)
         self.indexer = xapian.TermGenerator()
         self.indexer.set_stemmer(xapian.Stem("en"))
+        log.warning("end create_index");
 
     def _get_active_fedora_releases(self):
         response = self._call_api(self.bodhi_url + "/releases/?page=1&row_per_page=20")
         releases = response.get('releases', [])
+        pages = response.get('pages', [])
+        for page in range(2, pages + 1):
+            response = self._call_api(self.bodhi_url + ("/releases/?page=%d&row_per_page=20" % (page)))
+            releases += response.get('releases', [])
         active_fedora_releases = []
         for release in releases:
+            log.debug(release['dist_tag'])
             if release['id_prefix'].lower() == 'fedora' and\
-               release['state'] in ['current', 'pending']:
+               release['state'] in ['current', 'pending'] and\
+               release['composed_by_bodhi']:
+                log.debug(pprint.pformat(release))
                 active_fedora_releases.append(int(release['version']))
 
         active_fedora_releases.sort(reverse=True)
+        log.info("active fedora releases: " + " ".join(str(e) for e in active_fedora_releases))
 
         return active_fedora_releases
 
@@ -132,7 +161,10 @@ class Indexer(object):
                     continue
 
                 # Check the file to see if it is different
-                response = local.http.head(url)
+                response = local.http.head(url, allow_redirects=True)
+                if not bool(response):
+                    log.warn("Can't download %s, ignoring..." % (url))
+                    continue
                 remote_size = int(response.headers['content-length'])
                 local_size = stats.st_size
                 if remote_size == local_size:
@@ -198,6 +230,7 @@ class Indexer(object):
             kwargs['name'] = pkg_name
 
         for component in self.pdc.get_paged(self.pdc['global-components']._, **kwargs):
+            log.debug(component)
             yield component
 
     def latest_active(self, name, ignore=None):
@@ -230,7 +263,7 @@ class Indexer(object):
                 if name != comp.get('srpm_name'):
                     branch_info = self.latest_active(comp.get('srpm_name'))
                     return branch_info
-            raise ValueError('There is no active branch tied to a Fedora release')
+            raise ValueError('There is no active branch tied to a Fedora release for package %s' % (name))
         return branch_info
 
     def construct_package_dictionary(self, package):
@@ -252,12 +285,15 @@ class Indexer(object):
                                               'package': package},
                                              ...]},
         """
+        log.info("construct_package_dictionary start")
         package = copy.deepcopy(package)
 
         try:
             name = package['name']
             info = self.latest_active(name)
-        except:
+        except Exception as e:
+            log.warning(traceback.format_exc())
+            log.error(e)
             log.warning("Failed to get pdc info for %r" % name)
             return
 
@@ -281,13 +317,36 @@ class Indexer(object):
         package['status'] = info['active']
         package['icon'] = self.icon_cache.get(name, self.default_icon)
         package['branch'] = info['name']
-        package['sub_pkgs'] = list(self.get_sub_packages(package))
+        sb = self.get_sub_packages(package)
+        log.debug("types...")
+        log.debug(type(sb))
+        package['sub_pkgs'] = list(sb)
+        for idx in range(len(package['sub_pkgs'])):
+            branch = package['sub_pkgs'][idx]['branch']
+            name = package['sub_pkgs'][idx]['name']
+
+            if branch == 'master':
+                branch = 'rawhide'
+
+            url = "/".join([self.mdapi_url, branch, "files", name])
+            package['sub_pkgs'][idx]['file_data'] = self._call_api(url)
+
+        log.debug(type(package['sub_pkgs']))
 
         # This is a "parent" reference.  the base packages always have "none"
         # for it, but the sub packages have the name of their parent package in
         # it.
         package['package'] = None
 
+        branch = package['branch']
+
+        if branch == 'master':
+            branch = 'rawhide'
+
+        url = "/".join([self.mdapi_url, branch, "files", name])
+        package['file_data'] = self._call_api(url)
+
+        log.info("construct_package_dictionary end")
         return package
 
     def get_sub_packages(self, package):
@@ -299,7 +358,17 @@ class Indexer(object):
             branch = 'rawhide'
 
         url = "/".join([self.mdapi_url, branch, "srcpkg", name])
-        response = local.http.get(url)
+        # response = local.http.get(url)
+
+        retry = 0
+        while retry < 3:
+            try:
+                response = local.http.get(url)
+                break
+            except:
+                log.warning("API call (get_sub_packages) failed for %s" % url)
+            retry = retry + 1
+            log.warning("API call (get_sub_packages) retrying %d" % retry)
 
         if not bool(response):
             # TODO -- don't always do this.
@@ -307,7 +376,8 @@ class Indexer(object):
             # rawhide... but that's okay.  we just queried pkgdb, so we should
             # see if it is active in any other branches, and if it is, get the
             # sub-packages from there.
-            raise StopIteration
+            # raise StopIteration
+            return
 
         data = response.json()
         sub_package_names = sorted(set([
@@ -327,14 +397,16 @@ class Indexer(object):
             }
 
     def index_files_of_interest(self, doc, package_dict):
+        log.info("index_files_of_interest start")
         name = package_dict['name']
         branch = package_dict['branch']
 
         if branch == 'master':
             branch = 'rawhide'
 
-        url = "/".join([self.mdapi_url, branch, "files", name])
-        data = self._call_api(url)
+        #url = "/".join([self.mdapi_url, branch, "files", name])
+        #data = self._call_api(url)
+        data = package_dict['file_data']
         if data.get('files') is not None:
             for entry in data['files']:
                 filenames = entry['filenames'].split('/')
@@ -345,18 +417,25 @@ class Indexer(object):
                         exe_name = filter_search_string(os.path.basename(filename))
                         self.indexer.index_text_without_positions("EX__%s__EX" % exe_name)
         else:
-            log.warn("Failed to get file list for %r, %r" % (name, url))
+            log.warn("Failed to get file list for %r" % name)
             return
+        log.info("index_files_of_interest end")
 
     def index_packages(self):
         # This is a generator that yields dicts of package info that we index
-
+        log.info("index_packages start")
         packages = self.gather_pdc_packages()
+        log.info("got pdc high-level packages done")
+
+        def io_work_init():
+            log.info("create thread-local requests session...")
+            local.http = requests.session()
+            adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=3)
+            adapter.init_poolmanager(10, 10, False, timeout=60)
+            local.http.mount('https://', adapter)
+            local.http.mount('http://', adapter)
 
         def io_work(package):
-            log.info("indexing %s" % (package['name']))
-            local.http = requests.session()
-
             # Do all of the gathering...
             package = self.construct_package_dictionary(package)
 
@@ -367,17 +446,23 @@ class Indexer(object):
             return package
 
         pool = fedoracommunity.pool.ThreadPool(20)
-        packages = pool.map(io_work, packages)
+        packages_data = pool.map(io_work, io_work_init, packages)
 
-        for package in packages:
+        for package in packages_data:
             if package is None:
                 continue
             # And then prepare everything for xapian
             log.info("Processing final details for %s" % package['name'])
-            self._create_document(package)
+            try:
+                self._create_document(package)
+            except Exception as e:
+                log.warning(traceback.format_exc())
+                log.error(e)
         self.db.close()
+        log.info("index_packages end")
 
     def _create_document(self, package, old_doc=None):
+        log.info("_create_document start")
         doc = xapian.Document()
         self.indexer.set_document(doc)
         filtered_name = filter_search_string(package['name'])
@@ -444,6 +529,7 @@ class Indexer(object):
         if old_doc is not None:
             self.db.delete_document(old_doc.get_docid())
         self.db.commit()
+        log.info("_create_document end")
 
 
 def run(cache_path, bodhi_url=None,
@@ -454,6 +540,6 @@ def run(cache_path, bodhi_url=None,
     indexer.pull_icons()
     indexer.cache_icons()
 
-    log.info("Indexing packages.")
+    log.info("Indexing packages. run start")
     indexer.index_packages()
-    log.info("Indexed a ton of packages.")
+    log.info("Indexed a ton of packages. run end")
